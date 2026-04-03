@@ -1,9 +1,27 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-from playsound import playsound
 import threading
 import time
+from collections import deque
+import pygame  # for controlled sound playback
+
+# ------------------ Initialize Pygame Mixer ------------------ #
+pygame.mixer.init()
+alert_sound = pygame.mixer.Sound("alert.wav")  # used for both drowsy & sleeping
+
+# Function to play looping sound
+def play_loop():
+    if not pygame.mixer.get_busy():
+        alert_sound.play(-1)  # loop indefinitely
+
+# Function to play once for drowsy and stop after 2 seconds
+def play_drowsy():
+    alert_sound.play()
+    threading.Timer(2.0, stop_sound).start()  # stop after 2 seconds
+
+def stop_sound():
+    pygame.mixer.stop()
 
 # ------------------ MediaPipe Face Mesh ------------------ #
 mp_face_mesh = mp.solutions.face_mesh
@@ -21,7 +39,7 @@ def eye_aspect_ratio(eye):
     C = np.linalg.norm(np.array(eye[0]) - np.array(eye[3]))
     return (A + B) / (2.0 * C)
 
-def mouth_aspect_ratio_norm(landmarks):
+def mouth_aspect_ratio(landmarks):
     left = np.array([landmarks[61].x, landmarks[61].y])
     right = np.array([landmarks[291].x, landmarks[291].y])
     horizontal = np.linalg.norm(left - right)
@@ -34,36 +52,34 @@ def mouth_aspect_ratio_norm(landmarks):
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 EAR_THRESHOLD = 0.25
-
 MAR_THRESHOLD = 0.6
 
-BLINK_WINDOW = 2 * 60  # 2 minutes
-YAWN_WINDOW = 5 * 60   # 5 minutes
+BLINK_MIN_TIME = 1.0
+YAWN_MIN_TIME = 1.0
+SLEEP_MIN_TIME = 3.0
+NOD_MIN_DELTA = 0.02
+
+BLINK_WINDOW = 2 * 60
+YAWN_WINDOW = 5 * 60
 
 BLINK_THRESHOLD = 3
 YAWN_THRESHOLD = 3
 
-FRAME_RATE = 30  # camera FPS
-BLINK_MIN_FRAMES = 2 * FRAME_RATE  # 2 seconds
-YAWN_MIN_FRAMES = 2 * FRAME_RATE   # 2 seconds
-
-# ------------------ Counters ------------------ #
-eye_frame_counter = 0
-yawn_frame_counter = 0
+# ------------------ Counters / Timers ------------------ #
 blink_times = []
 yawn_times = []
+nod_times = []
 
-# Countdown timers
-blink_window_start = None
-yawn_window_start = None
+eye_start_time = None
+yawn_start_time = None
+sleep_start_time = None
+sleep_count = 0
 
-# ------------------ Alert ------------------ #
-ALERT_SOUND = "alert.wav"
-last_alert_time = 0
-ALERT_COOLDOWN = 5
+nose_y_history = deque(maxlen=10)
+nod_in_progress = False
 
-def play_alert():
-    threading.Thread(target=playsound, args=(ALERT_SOUND,), daemon=True).start()
+was_sleeping = False
+drowsy_alert_playing = False
 
 # ------------------ Camera ------------------ #
 cap = cv2.VideoCapture(0)
@@ -78,75 +94,114 @@ while True:
     results = face_mesh.process(rgb_frame)
     current_time = time.time()
 
+    driver_state = "Awake"  # default
+
     if results.multi_face_landmarks:
         for face_landmarks in results.multi_face_landmarks:
             h, w, _ = frame.shape
 
             # -------- Eyes -------- #
-            right_eye = [(int(face_landmarks.landmark[i].x * w), int(face_landmarks.landmark[i].y * h)) for i in RIGHT_EYE]
-            left_eye = [(int(face_landmarks.landmark[i].x * w), int(face_landmarks.landmark[i].y * h)) for i in LEFT_EYE]
+            right_eye = [(int(face_landmarks.landmark[i].x * w),
+                          int(face_landmarks.landmark[i].y * h)) for i in RIGHT_EYE]
+            left_eye = [(int(face_landmarks.landmark[i].x * w),
+                         int(face_landmarks.landmark[i].y * h)) for i in LEFT_EYE]
             ear = (eye_aspect_ratio(right_eye) + eye_aspect_ratio(left_eye)) / 2.0
 
-            # Detect blink only if eyes closed for 2 seconds
+            # -------- Blink / Sleep -------- #
             if ear < EAR_THRESHOLD:
-                eye_frame_counter += 1
+                if eye_start_time is None:
+                    eye_start_time = current_time
+                if sleep_start_time is None:
+                    sleep_start_time = current_time
             else:
-                if eye_frame_counter >= BLINK_MIN_FRAMES:
+                # Blink
+                if eye_start_time and current_time - eye_start_time >= BLINK_MIN_TIME:
                     blink_times.append(current_time)
-                    if blink_window_start is None:
-                        blink_window_start = current_time
-                eye_frame_counter = 0
+                eye_start_time = None
 
-            # Remove old blink events
+                # Reset after waking from sleep
+                if was_sleeping:
+                    blink_times.clear()
+                    yawn_times.clear()
+                    nod_times.clear()
+                    nose_y_history.clear()
+                    nod_in_progress = False
+                    was_sleeping = False
+                    stop_sound()
+
+                sleep_start_time = None
+
+            # Detect sleep
+            if sleep_start_time and (current_time - sleep_start_time) >= SLEEP_MIN_TIME:
+                driver_state = "SLEEPING"
+                if not was_sleeping:
+                    sleep_count += 1
+                    was_sleeping = True
+                    play_loop()  # loop alert while sleeping
+
             blink_times = [t for t in blink_times if current_time - t <= BLINK_WINDOW]
-            blink_window_start = blink_times[0] if blink_times else None
 
             # -------- Mouth / Yawn -------- #
-            mar = mouth_aspect_ratio_norm(face_landmarks.landmark)
+            mar = mouth_aspect_ratio(face_landmarks.landmark)
             if mar > MAR_THRESHOLD:
-                yawn_frame_counter += 1
+                if yawn_start_time is None:
+                    yawn_start_time = current_time
             else:
-                if yawn_frame_counter >= YAWN_MIN_FRAMES:
+                if yawn_start_time and current_time - yawn_start_time >= YAWN_MIN_TIME:
                     yawn_times.append(current_time)
-                    if yawn_window_start is None:
-                        yawn_window_start = current_time
-                yawn_frame_counter = 0
-
-            # Remove old yawn events
+                yawn_start_time = None
             yawn_times = [t for t in yawn_times if current_time - t <= YAWN_WINDOW]
-            yawn_window_start = yawn_times[0] if yawn_times else None
 
-            # -------- Display EAR / MAR -------- #
+            # -------- Head Nod -------- #
+            nose_y = face_landmarks.landmark[1].y
+            nose_y_history.append(nose_y)
+            if len(nose_y_history) >= 2:
+                dy = nose_y_history[-1] - nose_y_history[-2]
+                if dy > NOD_MIN_DELTA and not nod_in_progress:
+                    nod_in_progress = True
+                elif dy < -NOD_MIN_DELTA and nod_in_progress:
+                    nod_times.append(current_time)
+                    nod_in_progress = False
+
+            # -------- Drowsy detection -------- #
+            if driver_state != "SLEEPING":
+                if len(blink_times) >= BLINK_THRESHOLD or len(yawn_times) >= YAWN_THRESHOLD:
+                    driver_state = "DROWSY"
+                    if not drowsy_alert_playing:
+                        drowsy_alert_playing = True
+                        play_drowsy()
+                else:
+                    drowsy_alert_playing = False
+
+            # -------- Display Parameters -------- #
             cv2.putText(frame, f"EAR: {ear:.2f} | Blinks: {len(blink_times)}", (30, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             cv2.putText(frame, f"MAR: {mar:.2f} | Yawns: {len(yawn_times)}", (30, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame, f"Nods: {len(nod_times)}", (30, 130),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame, f"Sleep Count: {sleep_count}", (30, 160),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-            # -------- Display Countdown Timers -------- #
-            if blink_window_start:
-                blink_countdown = max(0, int(BLINK_WINDOW - (current_time - blink_window_start)))
-                cv2.putText(frame, f"Blink Window: {blink_countdown}s", (30, 130),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-            if yawn_window_start:
-                yawn_countdown = max(0, int(YAWN_WINDOW - (current_time - yawn_window_start)))
-                cv2.putText(frame, f"Yawn Window: {yawn_countdown}s", (30, 160),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-
-            # -------- Draw Landmarks -------- #
+            # Draw landmarks
             for (x, y) in right_eye + left_eye:
                 cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
-            for i in [61, 291, 13, 14]:
+            for i in [61, 291, 13, 14, 1, 33, 362]:
                 x, y = int(face_landmarks.landmark[i].x * w), int(face_landmarks.landmark[i].y * h)
                 cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
 
-    # -------- Danger Alert -------- #
-    danger = len(blink_times) >= BLINK_THRESHOLD or len(yawn_times) >= YAWN_THRESHOLD
-    if danger:
-        cv2.putText(frame, "!!! DANGER ALERT !!!", (30, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-        if (current_time - last_alert_time) > ALERT_COOLDOWN:
-            play_alert()
-            last_alert_time = current_time
+    # -------- Display Driver State -------- #
+    color = (0, 255, 0) if driver_state=="Awake" else (0, 255, 255) if driver_state=="DROWSY" else (0, 0, 255)
+    cv2.putText(frame, f"Driver State: {driver_state}", (30, 260),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+    if driver_state == "DROWSY":
+        cv2.putText(frame, "Stay Awake / Take Rest", (30, 300),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+    # Stop looping alert if driver wakes up
+    if driver_state == "Awake" and was_sleeping:
+        stop_sound()
+        was_sleeping = False
 
     cv2.imshow("Driver Status Detection", frame)
     if cv2.waitKey(1) & 0xFF == 27:
