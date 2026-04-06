@@ -64,8 +64,7 @@ YAWN_WINDOW = 5 * 60
 BLINK_THRESHOLD = 3
 YAWN_THRESHOLD = 3
 
-# ------------------ DSP SMOOTHING (NEW) ------------------ #
-# Moving Average Buffers (Noise Reduction)
+# ------------------ DSP SMOOTHING ------------------ #
 EAR_BUFFER = deque(maxlen=5)
 MAR_BUFFER = deque(maxlen=5)
 
@@ -110,15 +109,13 @@ while True:
             left_eye = [(int(face_landmarks.landmark[i].x * w),
                          int(face_landmarks.landmark[i].y * h)) for i in LEFT_EYE]
 
-            # ===== RAW EAR =====
             ear_raw = (eye_aspect_ratio(right_eye) +
                        eye_aspect_ratio(left_eye)) / 2.0
 
-            # ===== DSP MOVING AVERAGE FILTER =====
             EAR_BUFFER.append(ear_raw)
             ear = sum(EAR_BUFFER) / len(EAR_BUFFER)
 
-            # -------- Blink / Sleep -------- #
+            # Blink & Sleep detection
             if ear < EAR_THRESHOLD:
                 if eye_start_time is None:
                     eye_start_time = current_time
@@ -152,7 +149,6 @@ while True:
             # -------- Mouth / Yawn -------- #
             mar_raw = mouth_aspect_ratio(face_landmarks.landmark)
 
-            # ===== DSP MOVING AVERAGE FILTER =====
             MAR_BUFFER.append(mar_raw)
             mar = sum(MAR_BUFFER) / len(MAR_BUFFER)
 
@@ -188,18 +184,26 @@ while True:
                 else:
                     drowsy_alert_playing = False
 
-            # -------- Display -------- #
+            # -------- Display Values -------- #
             cv2.putText(frame, f"EAR: {ear:.2f} | Blinks: {len(blink_times)}",
-                        (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-
+                        (30,50), cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,0),2)
             cv2.putText(frame, f"MAR: {mar:.2f} | Yawns: {len(yawn_times)}",
-                        (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-
+                        (30,90), cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,0),2)
             cv2.putText(frame, f"Nods: {len(nod_times)}",
-                        (30,130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-
+                        (30,130), cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,0),2)
             cv2.putText(frame, f"Sleep Count: {sleep_count}",
-                        (30,160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                        (30,160), cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,0),2)
+
+            # -------- LANDMARK INDICATORS (RESTORED) -------- #
+            # Eyes (Green)
+            for (x, y) in right_eye + left_eye:
+                cv2.circle(frame, (x, y), 2, (0,255,0), -1)
+
+            # Mouth + Nose reference (Blue)
+            for i in [61, 291, 13, 14, 1]:
+                x = int(face_landmarks.landmark[i].x * w)
+                y = int(face_landmarks.landmark[i].y * h)
+                cv2.circle(frame, (x, y), 2, (255,0,0), -1)
 
     # -------- Driver State Display -------- #
     color = (0,255,0) if driver_state=="Awake" else \
@@ -210,8 +214,7 @@ while True:
 
     if driver_state == "DROWSY":
         cv2.putText(frame, "Stay Awake / Take Rest",
-                    (30,300), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (0,255,255), 2)
+                    (30,300), cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,255),2)
 
     if driver_state == "Awake" and was_sleeping:
         stop_sound()
